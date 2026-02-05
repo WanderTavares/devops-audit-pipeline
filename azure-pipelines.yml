@@ -1,0 +1,420 @@
+trigger:
+- main
+
+variables:
+- group: appinsights-telemetry
+- name: auditFile
+  value: compliance-report.txt
+
+stages:
+
+- stage: Build
+  displayName: "Build Stage"
+  jobs:
+  - job: Build
+    pool:
+      name: Default
+    steps:
+    - powershell: |
+        echo "PIPELINE AUDIT REPORT" > $(auditFile)
+        .\mvnw clean package -DskipTests
+        Add-Content $(auditFile) "Stage: Build → PASSED"
+        Add-Content $(auditFile) "Timestamp: $(Get-Date -Format u)"
+      displayName: "Build Petclinic + Audit"
+
+    - powershell: |
+        pwsh .\scripts\send-telemetry.ps1 -StageName "Build" -Status "Succeeded"
+      env:
+        APPINSIGHTS_CONNECTION_STRING: $(APPINSIGHTS_INSTRUMENTATION_KEY)
+      displayName: "Send Build Succeeded Telemetry"
+
+    - powershell: |
+        pwsh .\scripts\send-telemetry.ps1 -StageName "Build" -Status "Failed"
+      env:
+        APPINSIGHTS_CONNECTION_STRING: $(APPINSIGHTS_INSTRUMENTATION_KEY)
+      condition: failed()
+      displayName: "Send Build Failed Telemetry"
+
+    - publish: $(auditFile)
+      artifact: audit-report-build
+
+
+- stage: Quality
+  displayName: "Quality Gate - SonarCloud"
+  dependsOn: Build
+  condition: succeeded()
+  jobs:
+  - job: Sonar
+    pool:
+      name: Default
+    steps:
+    - task: SonarCloudPrepare@4
+      inputs:
+        SonarCloud: SonarCloud-Connection
+        organization: wanderberriel
+        scannerMode: 'CLI'
+        configMode: 'manual'
+        cliProjectKey: wanderberriel_devops-audit-pipeline
+        cliProjectName: devops-audit-pipeline
+        extraProperties: |
+          sonar.sources=src/main/java
+          sonar.tests=src/test/java
+          sonar.java.binaries=target/classes
+          sonar.junit.reportPaths=target/surefire-reports
+          sonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml
+          sonar.scanner.skipJreProvisioning=true
+
+    - task: Maven@4
+      inputs:
+        mavenPomFile: 'pom.xml'
+        goals: 'clean verify'
+        options: ''
+    
+    - task: SonarCloudAnalyze@4
+      displayName: "Run Sonar Scanner"
+
+    - task: SonarCloudPublish@4
+      inputs:
+        pollingTimeoutSec: 300
+
+    - powershell: |
+        Add-Content $(auditFile) "Stage: Quality Gate → PASSED (SonarCloud)"
+        Add-Content $(auditFile) "Timestamp: $(Get-Date -Format u)"
+      displayName: "Quality + Audit"
+
+    - powershell: |
+        $report = @{
+          pipeline = "$(Build.DefinitionName)"
+          buildId  = "$(Build.BuildId)"
+          runUrl   = "$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)"
+          timestamp = (Get-Date).ToUniversalTime().ToString("o")
+
+          stages = @(
+            @{ name = "Build";    status = "Succeeded" }
+            @{ name = "Test";     status = "Succeeded" }
+            @{ name = "Quality";  status = "Succeeded" }
+          )
+
+          sonar = @{
+            projectKey = "wanderberriel_devops-audit-pipeline"
+            dashboard  = "https://sonarcloud.io/dashboard?id=wanderberriel_devops-audit-pipeline"
+          }
+        }
+
+        $json = $report | ConvertTo-Json -Depth 10
+        $json | Out-File "quality-report.json" -Encoding utf8
+
+        $html = @"
+        <html>
+        <head><title>Quality Report</title></head>
+        <body>
+          <h1>Pipeline Quality Report</h1>
+          <p><b>Pipeline:</b> $($report.pipeline)</p>
+          <p><b>Build ID:</b> $($report.buildId)</p>
+          <p><b>Timestamp:</b> $($report.timestamp)</p>
+
+          <h2>Stages</h2>
+          <ul>
+            <li>Build - Succeeded</li>
+            <li>Test - Succeeded</li>
+            <li>Quality - Succeeded</li>
+          </ul>
+
+          <h2>SonarCloud</h2>
+          <a href="$($report.sonar.dashboard)">View in SonarCloud</a>
+        </body>
+        </html>
+        "@
+
+        $html | Out-File "quality-report.html" -Encoding utf8
+      displayName: "Generate Quality Report"
+      
+    - powershell: |
+        pwsh .\scripts\send-telemetry.ps1 -StageName "Quality" -Status "Succeeded"
+      env:
+        APPINSIGHTS_CONNECTION_STRING: $(APPINSIGHTS_INSTRUMENTATION_KEY)
+      displayName: "Send Quality Succeeded Telemetry"
+
+    - powershell: |
+        pwsh .\scripts\send-telemetry.ps1 -StageName "Quality" -Status "Failed"
+      env:
+        APPINSIGHTS_CONNECTION_STRING: $(APPINSIGHTS_INSTRUMENTATION_KEY)
+      condition: failed()
+      displayName: "Send Quality Failed Telemetry"
+
+    - publish: $(auditFile)
+      artifact: audit-report-quality
+
+    - publish: quality-report.html
+      artifact: quality-report-html
+
+- stage: Policy
+  displayName: "Kubernetes Governance & Policy Enforcement"
+  dependsOn: Quality
+  condition: succeeded()
+  jobs:
+  - job: EnforcePolicies
+    steps:
+    - powershell: |
+        pwsh .\scripts\enforce-standards.ps1
+      displayName: "Validate & Enforce Kubernetes Policies"
+
+    - powershell: |
+        pwsh .\scripts\send-telemetry.ps1 -StageName "Policy" -Status "Succeeded"
+      env:
+        APPINSIGHTS_CONNECTION_STRING: $(APPINSIGHTS_INSTRUMENTATION_KEY)
+      displayName: "Send Policy Succeeded Telemetry"
+
+    - powershell: |
+        pwsh .\scripts\send-telemetry.ps1 -StageName "Policy" -Status "Failed"
+      env:
+        APPINSIGHTS_CONNECTION_STRING: $(APPINSIGHTS_INSTRUMENTATION_KEY)
+      condition: failed()
+      displayName: "Send Policy Failed Telemetry"
+
+- stage: Containerize
+  dependsOn: Policy
+  condition: succeeded()
+  jobs:
+  - job: DockerBuild
+    pool:
+      name: Default
+    steps:
+    - task: Docker@2
+      displayName: "Login to Container Registry"
+      inputs:
+        command: login
+        containerRegistry: wanderdevopsregistry
+
+    - powershell: |
+        .\mvnw.cmd `
+          "-B" `
+          "-ntp" `
+          "spring-boot:build-image" `
+          "-DskipTests" `
+          "-Dspring-boot.build-image.imageName=wanderdevopsregistry.azurecr.io/petclinic:latest"
+      displayName: "Build Container Image with mvnw (PowerShell)"
+
+    - powershell: |
+        docker push wanderdevopsregistry.azurecr.io/petclinic:latest
+      displayName: "Push image to ACR"
+
+    - powershell: |
+        Add-Content $(auditFile) "Stage: Containerize → PASSED"
+        Add-Content $(auditFile) "Image: petclinic:latest"
+        Add-Content $(auditFile) "Timestamp: $(Get-Date -Format u)"
+      displayName: "Containerize + Audit"
+
+    - powershell: |
+        pwsh .\scripts\send-telemetry.ps1 -StageName "Containerize" -Status "Succeeded"
+      env:
+        APPINSIGHTS_CONNECTION_STRING: $(APPINSIGHTS_INSTRUMENTATION_KEY)
+      displayName: "Send Containerize Succeeded Telemetry"
+
+    - powershell: |
+        pwsh .\scripts\send-telemetry.ps1 -StageName "Containerize" -Status "Failed"
+      env:
+        APPINSIGHTS_CONNECTION_STRING: $(APPINSIGHTS_INSTRUMENTATION_KEY)
+      condition: failed()
+      displayName: "Send Containerize Failed Telemetry"
+
+    - publish: $(auditFile)
+      artifact: audit-report-containerize
+
+- stage: Security_PreProd
+  dependsOn: Containerize
+  condition: succeeded()
+  jobs:
+    - deployment: Security_PreProd
+      displayName: "Deploy on Local Agent"
+      environment: production
+      pool:
+        name: Default
+
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - powershell: |
+                echo "Deploying Petclinic local ..."
+                docker run -d `
+                  --name petclinic `
+                  -p 8080:8080 `
+                  wanderdevopsregistry.azurecr.io/petclinic:latest
+              displayName: "Run application container"
+
+            - powershell: |
+                docker run --rm `
+                  -u root `
+                  -v "$(Build.SourcesDirectory):/zap/wrk" `
+                  zaproxy/zap-stable `
+                  zap-baseline.py `
+                  -t http://host.docker.internal:8080 `
+                  -r zap-report.html `
+                  -I
+              displayName: "Run OWASP ZAP Baseline Scan"
+
+            - powershell: |
+                docker rm -f petclinic
+              displayName: "Stop application container"
+              condition: always()
+
+            - powershell: |
+                Write-Host "========================================="
+                Write-Host "🚨 SECURITY ALERT - PRE-PRODUCTION DAST 🚨"
+                Write-Host ""
+                Write-Host "To: security-team@transfero.com"
+                Write-Host "Cc: devops-team@transfero.com"
+                Write-Host ""
+                Write-Host "Subject: [BLOCKED] DAST Failure - Pre-Prod Environment"
+                Write-Host ""
+                Write-Host "Message:"
+                Write-Host "The OWASP ZAP Pre-Production DAST scan has FAILED."
+                Write-Host ""
+                Write-Host "Pipeline : $(Build.DefinitionName)"
+                Write-Host "Build ID : $(Build.BuildId)"
+                Write-Host "Agent    : $(Agent.Name)"
+                Write-Host "Stage    : Security Gate - Pre-Prod"
+                Write-Host ""
+                Write-Host "Please review the ZAP report artifact"
+                Write-Host ""
+                Write-Host "Deployment to Production has been BLOCKED."
+                Write-Host "========================================="
+              displayName: "Notify Security Team security-team@transfero.com"
+              condition: failed()
+
+            - powershell: |
+                Add-Content $(auditFile) "Stage: DeployContainer → EXECUTED"
+                Add-Content $(auditFile) "Image: petclinic:latest"
+                Add-Content $(auditFile) "Timestamp: $(Get-Date -Format u)"
+              displayName: "Deploy + Audit"
+
+            - powershell: |
+                pwsh .\scripts\send-telemetry.ps1 -StageName "Security_PreProd" -Status "Succeeded"
+              env:
+                APPINSIGHTS_CONNECTION_STRING: $(APPINSIGHTS_INSTRUMENTATION_KEY)
+              displayName: "Send Security_PreProd Succeeded Telemetry"
+
+            - powershell: |
+                pwsh .\scripts\send-telemetry.ps1 -StageName "Security_PreProd" -Status "Failed"
+              env:
+                APPINSIGHTS_CONNECTION_STRING: $(APPINSIGHTS_INSTRUMENTATION_KEY)
+              condition: failed()
+              displayName: "Send Security_PreProd Failed Telemetry"
+
+            - publish: $(auditFile)
+              artifact: audit-report-security-pre-prod
+
+            - publish: zap-report.html
+              artifact: zap-report-html
+
+
+- stage: Deploy
+  dependsOn: Security_PreProd
+  condition: succeeded()
+  jobs:
+    - deployment: DeployProduction
+      displayName: "Deploy"
+      environment: production
+      pool:
+        name: Default
+
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - powershell: |
+                echo "Deploying Petclinic manifests to local Kubernetes cluster..."
+                kubectl apply -f k8s
+              displayName: "Deploy Petclinic to Local Cluster"
+
+            - powershell: |
+                Add-Content $(auditFile) "Stage: Deploy → EXECUTED"
+                Add-Content $(auditFile) "Image: petclinic:latest"
+                Add-Content $(auditFile) "Timestamp: $(Get-Date -Format u)"
+              displayName: "Deploy + Audit"
+
+            - powershell: |
+                pwsh .\scripts\send-telemetry.ps1 -StageName "Deploy" -Status "Succeeded"
+              env:
+                APPINSIGHTS_CONNECTION_STRING: $(APPINSIGHTS_INSTRUMENTATION_KEY)
+              displayName: "Send Deploy Succeeded Telemetry"
+
+            - powershell: |
+                pwsh .\scripts\send-telemetry.ps1 -StageName "Deploy" -Status "Failed"
+              env:
+                APPINSIGHTS_CONNECTION_STRING: $(APPINSIGHTS_INSTRUMENTATION_KEY)
+              condition: failed()
+              displayName: "Send Deploy Failed Telemetry"
+
+            - publish: $(auditFile)
+              artifact: audit-report-deploy
+
+- stage: Security_Prod_Verification
+  displayName: "Security Verification - DAST (Production)"
+  dependsOn: Deploy
+  condition: succeeded()
+  jobs:
+  - job: DAST
+    pool:
+      name: Default
+    steps:
+    - powershell: |
+        docker run --rm `
+          -u root `
+          -v "$(Build.SourcesDirectory):/zap/wrk" `
+          zaproxy/zap-stable `
+          zap-baseline.py `
+          -t http://host.docker.internal:32698 `
+          -r zap-report.html `
+          -I
+      displayName: "Security DAST"
+    
+    - powershell: |
+        Add-Content $(auditFile) "Stage: Security_Prod_Verification → EXECUTED"
+        Add-Content $(auditFile) "Timestamp: $(Get-Date -Format u)"
+      displayName: "Security_Prod_Verification + Audit"
+
+    - powershell: |
+                Write-Host "========================================="
+                Write-Host "🚨 SECURITY ALERT - PRODUCTION DAST 🚨"
+                Write-Host ""
+                Write-Host "To: security-team@transfero.com"
+                Write-Host "Cc: devops-team@transfero.com"
+                Write-Host ""
+                Write-Host "Subject: [BLOCKED] DAST Failure - Prod Environment"
+                Write-Host ""
+                Write-Host "Message:"
+                Write-Host "The OWASP ZAP Production DAST scan has FAILED."
+                Write-Host ""
+                Write-Host "Pipeline : $(Build.DefinitionName)"
+                Write-Host "Build ID : $(Build.BuildId)"
+                Write-Host "Agent    : $(Agent.Name)"
+                Write-Host "Stage    : Security Gate - Pre-Prod"
+                Write-Host ""
+                Write-Host "Please review the ZAP report artifact"
+                Write-Host ""
+                Write-Host "Deployment to Production has been BLOCKED."
+                Write-Host "========================================="
+
+      displayName: "Notify Security Team security-team@transfero.com"
+      condition: failed()
+
+    - powershell: |
+        pwsh .\scripts\send-telemetry.ps1 -StageName "Security_Prod_Verification" -Status "Succeeded"
+      env:
+        APPINSIGHTS_CONNECTION_STRING: $(APPINSIGHTS_INSTRUMENTATION_KEY)
+      displayName: "Send Security_Prod_Verification Succeeded Telemetry"
+
+    - powershell: |
+        pwsh .\scripts\send-telemetry.ps1 -StageName "Security_Prod_Verification" -Status "Failed"
+      env:
+        APPINSIGHTS_CONNECTION_STRING: $(APPINSIGHTS_INSTRUMENTATION_KEY)
+      condition: failed()
+      displayName: "Send Security_Prod_Verification Failed Telemetry"
+
+    - publish: $(auditFile)
+      artifact: audit-report-security
+
+    - publish: $(Build.SourcesDirectory)/zap-report.html
+      artifact: zap-report-prod-html

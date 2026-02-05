@@ -1,0 +1,39 @@
+<?xml version="1.0"?>
+<!DOCTYPE suppressions PUBLIC
+  "-//Checkstyle//DTD SuppressionFilter Configuration 1.2//EN"
+  "https://checkstyle.org/dtds/suppressions_1_2.dtd">
+
+<suppressions>
+
+  <!-- Dependências e build -->
+  <suppress files="node_modules[\\/].*" checks=".*"/>
+  <suppress files="node[\\/].*" checks=".*"/>
+  <suppress files="build[\\/].*" checks=".*"/>
+  <suppress files="target[\\/].*" checks=".*"/>
+  <suppress files="azure-pipelines.*" checks="NoHttp"/>
+
+
+  <!-- Binários e artefatos -->
+  <suppress
+      files=".+\.(jar|git|ico|p12|gif|jks|jpg|svg|log)"
+      checks="NoHttpCheck"/>
+
+  <!-- Pipeline e infraestrutura -->
+  <suppress
+      files="azure-pipelines\.yml"
+      checks="NoHttpCheck"/>
+
+  <suppress
+      files="scripts[\\/].*"
+      checks="NoHttpCheck"/>
+
+  <suppress
+      files="k8s[\\/].*"
+      checks="NoHttpCheck"/>
+
+  <!-- Relatórios -->
+  <suppress
+      files=".+\.html"
+      checks="NoHttpCheck"/>
+
+</suppressions>
